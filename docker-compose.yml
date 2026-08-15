@@ -3,7 +3,8 @@ name: otel-poc
 # ---------------------------------------------------------------------------
 # OpenTelemetry POC — Grafana stack (Prometheus instead of Mimir)
 #
-#   apps (checkout, payments) --OTLP--> otel-collector --+--> Tempo   (traces)
+#   apps (trading-engine, feed-handler) --OTLP--> otel-collector
+#                                                        +--> Tempo   (traces)
 #                                                        +--> Loki    (logs)
 #                                                        +--> Prometheus (metrics, remote write)
 #   Grafana reads from Prometheus / Loki / Tempo.
@@ -110,18 +111,18 @@ services:
           memory: 512M
 
   # ---------------------------------------------------------------- demo apps
-  checkout:
-    build: ./apps/checkout
+  trading-engine:
+    build: ./apps/trading-engine
     restart: unless-stopped
     environment:
       <<: *app-otel-env
-      OTEL_SERVICE_NAME: checkout
-      PAYMENTS_URL: http://payments:8081
+      OTEL_SERVICE_NAME: trading-engine
+      FEED_HANDLER_URL: http://feed-handler:8081
     ports:
       - "8080:8080"
     depends_on:
       - otel-collector
-      - payments
+      - feed-handler
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 10s
@@ -129,12 +130,12 @@ services:
       retries: 5
       start_period: 15s
 
-  payments:
-    build: ./apps/payments
+  feed-handler:
+    build: ./apps/feed-handler
     restart: unless-stopped
     environment:
       <<: *app-otel-env
-      OTEL_SERVICE_NAME: payments
+      OTEL_SERVICE_NAME: feed-handler
     depends_on:
       - otel-collector
     healthcheck:
@@ -148,9 +149,9 @@ services:
     build: ./apps/loadgen
     restart: unless-stopped
     environment:
-      CHECKOUT_URL: http://checkout:8080
+      TRADING_ENGINE_URL: http://trading-engine:8080
     depends_on:
-      checkout:
+      trading-engine:
         condition: service_healthy
 
 volumes:
