@@ -1,0 +1,98 @@
+# OpenTelemetry Collector — central telemetry pipeline.
+# Receives OTLP from the apps, generates RED / service-graph metrics from
+# spans, and fans out to Tempo (traces), Loki (logs) and Prometheus (metrics).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Always first in every pipeline: protects the collector from OOM.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+connectors:
+  # RED metrics (rate / errors / duration) derived from spans.
+  spanmetrics:
+    namespace: traces.span.metrics
+    histogram:
+      unit: s
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+    dimensions:
+      - name: http.response.status_code
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 15s
+
+  # Edge metrics between services, used by Grafana's Tempo service map.
+  servicegraph:
+    metrics_flush_interval: 15s
+    store:
+      ttl: 2s
+      max_items: 1000
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    # Promote resource attributes (service.name, ...) to metric labels so
+    # dashboards can filter without joining on target_info. Fine at POC
+    # scale; review cardinality before doing this in a large fleet.
+    resource_to_telemetry_conversion:
+      enabled: true
+    # target_info would be emitted once per pipeline (app metrics + derived
+    # span metrics share resources) and collide as out-of-order samples;
+    # it is redundant with resource_to_telemetry_conversion anyway.
+    target_info:
+      enabled: false
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, spanmetrics, servicegraph]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+    metrics/derived:
+      receivers: [spanmetrics, servicegraph]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]
