@@ -148,6 +148,66 @@ services:
       retries: 5
       start_period: 15s
 
+  # ------------------------------------------------- eBPF auto-instrumentation
+  # Beyla attaches to each app's PID namespace and captures HTTP at the
+  # kernel level — zero-code metrics to contrast with the SDK telemetry.
+  # Metrics-only OTLP export so eBPF traces don't duplicate the SDK traces.
+  beyla-trading-engine:
+    image: grafana/beyla:2.2.0
+    restart: unless-stopped
+    privileged: true
+    pid: "service:trading-engine"
+    environment:
+      BEYLA_OPEN_PORT: "8080"
+      BEYLA_METRICS_FEATURES: application,network
+      BEYLA_NETWORK_METRICS: "true"
+      BEYLA_METRICS_INTERVAL: 15s
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    depends_on:
+      - trading-engine
+      - otel-collector
+
+  beyla-feed-handler:
+    image: grafana/beyla:2.2.0
+    restart: unless-stopped
+    privileged: true
+    pid: "service:feed-handler"
+    environment:
+      BEYLA_OPEN_PORT: "8081"
+      BEYLA_METRICS_FEATURES: application,network
+      BEYLA_NETWORK_METRICS: "true"
+      BEYLA_METRICS_INTERVAL: 15s
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    depends_on:
+      - feed-handler
+      - otel-collector
+
+  # OS/kernel-level eBPF metrics for the whole host: block I/O latency,
+  # syscalls, softirq latency, page-cache hit ratio, TCP retransmits,
+  # SYN backlog, UDP drops, OOM kills, process execs. Scraped by Prometheus.
+  ebpf-exporter:
+    image: ghcr.io/cloudflare/ebpf_exporter:latest
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    environment:
+      # exec-trace emits kernel-level process-exec spans over OTLP -> Tempo.
+      OTEL_SERVICE_NAME: kernel-ebpf
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    command:
+      - --config.dir=/examples
+      # Every bundled metric-producing example that attaches on kernel 6.17.
+      # Excluded: cgroup-rstat-flushing + cachestat-pre-kernel-5.16 (won't
+      # load on 6.17), xdp (attaches to host network interfaces), and the
+      # remaining *-trace configs (span emitters that would flood Tempo;
+      # exec-trace is kept because exec volume is low).
+      - --config.names=accept-latency,biolatency,bpf-jit,cachestat,cephfs-dist,cfs-throttling,cgroup,exec-trace,ext4dist,icmp-ip,inet-frags,kfree_skb,kstack,llcstat,oomkill,pci,percpu-softirq,raw-tracepoints,regexp,shrinklat,softirq-latency,syscalls,tcp-retransmit,tcp-syn-backlog,tcp-window-clamps,timers,udp-drops,unix-accept-latency,unix-socket-backlog,uprobe
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+
   loadgen:
     build: ./apps/loadgen
     restart: unless-stopped
