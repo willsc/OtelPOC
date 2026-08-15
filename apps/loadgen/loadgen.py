@@ -1,8 +1,8 @@
-"""Continuous order-flow generator for the trading engine.
+"""Continuous order-flow generator for the crypto trading engine.
 
-Mostly valid orders across the tradable universe, plus the occasional
-non-tradable symbol and oversized (risk-breaching) order so every signal
-(fill, 4xx reject, 5xx error) shows up in the data.
+Mostly valid orders across the tradable pairs, plus the occasional delisted
+pair and notional-breaching order so every signal (fill, 4xx reject,
+5xx error) shows up in the data.
 """
 
 import logging
@@ -17,16 +17,25 @@ log = logging.getLogger("loadgen")
 
 TRADING_ENGINE_URL = os.environ.get("TRADING_ENGINE_URL", "http://trading-engine:8080")
 
-SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
+# pair -> typical order size range in base asset
+PAIRS = {
+    "BTC/USDT": (0.001, 0.5),
+    "ETH/USDT": (0.01, 10.0),
+    "SOL/USDT": (0.5, 200.0),
+    "XRP/USDT": (50.0, 20_000.0),
+    "DOGE/USDT": (100.0, 100_000.0),
+}
 ACCOUNTS = [f"ACC-{i:04d}" for i in range(1, 21)]
 
 
 def random_order() -> dict:
+    pair = random.choice(list(PAIRS))
+    lo, hi = PAIRS[pair]
     return {
         "account_id": random.choice(ACCOUNTS),
-        "symbol": random.choice(SYMBOLS),
+        "pair": pair,
         "side": random.choice(["buy", "sell"]),
-        "qty": max(1, int(random.lognormvariate(4.5, 1.2))),
+        "amount": round(random.uniform(lo, hi), 6),
     }
 
 
@@ -38,11 +47,11 @@ def main() -> None:
             order = random_order()
             roll = random.random()
             if roll < 0.05:
-                order["symbol"] = "ENRN"  # not tradable -> 400
+                order["pair"] = "LUNA/USDT"  # delisted -> 400
             elif roll < 0.10:
-                order["qty"] = random.randint(20_000, 80_000)  # breaches risk -> 409
+                order["amount"] = PAIRS.get(order["pair"], (1, 1))[1] * 100  # breaches notional -> 409
             r = client.post(f"{TRADING_ENGINE_URL}/orders", json=order)
-            log.info("%s %d %s -> %d", order["side"], order["qty"], order["symbol"], r.status_code)
+            log.info("%s %s %s -> %d", order["side"], order["amount"], order["pair"], r.status_code)
         except httpx.HTTPError as exc:
             log.warning("request failed: %s", exc)
         time.sleep(random.uniform(0.2, 1.0))

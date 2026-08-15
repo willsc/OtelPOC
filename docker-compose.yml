@@ -3,8 +3,8 @@ name: otel-poc
 # ---------------------------------------------------------------------------
 # OpenTelemetry POC — Grafana stack (Prometheus instead of Mimir)
 #
-#   apps (trading-engine, feed-handler) --OTLP--> otel-collector
-#                                                        +--> Tempo   (traces)
+#   feed-handler --pushes ticks--> trading-engine <--orders-- loadgen
+#   apps --OTLP--> otel-collector --+--> Tempo   (traces)
 #                                                        +--> Loki    (logs)
 #                                                        +--> Prometheus (metrics, remote write)
 #   Grafana reads from Prometheus / Loki / Tempo.
@@ -117,12 +117,10 @@ services:
     environment:
       <<: *app-otel-env
       OTEL_SERVICE_NAME: trading-engine
-      FEED_HANDLER_URL: http://feed-handler:8081
     ports:
       - "8080:8080"
     depends_on:
       - otel-collector
-      - feed-handler
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 10s
@@ -136,8 +134,13 @@ services:
     environment:
       <<: *app-otel-env
       OTEL_SERVICE_NAME: feed-handler
+      TRADING_ENGINE_URL: http://trading-engine:8080
     depends_on:
-      - otel-collector
+      otel-collector:
+        condition: service_started
+      # Publisher waits for its subscriber so the first batches land.
+      trading-engine:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz')"]
       interval: 10s

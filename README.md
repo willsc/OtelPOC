@@ -1,44 +1,49 @@
 # OpenTelemetry POC — Grafana Stack with Prometheus
 
-A self-contained, end-to-end OpenTelemetry proof of concept: a simulated
-**trading engine** and **market-data feed handler** (plus an order-flow
-generator) feed **traces, metrics and logs** through an **OpenTelemetry
-Collector** into the Grafana stack — with **Prometheus** as the metrics
-backend (instead of Mimir).
+A self-contained, end-to-end OpenTelemetry proof of concept for a simulated
+**crypto trading environment**: a multi-venue market-data **feed handler**
+pushes a consolidated book to a **trading engine** (plus an order-flow
+generator), and all three emit **traces, metrics and logs** through an
+**OpenTelemetry Collector** into the Grafana stack — with **Prometheus** as
+the metrics backend (instead of Mimir).
 
 ```
-                                              ┌────────────► Tempo ────────┐  traces
- loadgen ──► trading-engine ──► feed-handler  │                            │
- (orders)         │                  │        ├────────────► Loki ─────────┤  logs
-                  └───────OTLP───────┴──► OTel Collector                   ├──► Grafana
-                                              │  (spanmetrics +           │
-                                              │   servicegraph)           │
-                                              └─remote write─► Prometheus ┘  metrics
+ feed-handler ──pushes book──► trading-engine ◄──orders── loadgen
+      │                              │
+      └─────────────OTLP─────────────┴──► OTel Collector ──┬──► Tempo      (traces)
+                                          (spanmetrics +   ├──► Loki       (logs)
+                                           servicegraph)   └──► Prometheus (metrics,
+                                                                remote write)
+                                                Grafana reads from all three
 ```
 
 ## Demo applications
 
-- **feed-handler** — simulates a market-data feed: a background task applies
-  random-walk ticks for a 5-symbol universe (AAPL, MSFT, NVDA, AMZN, TSLA),
-  maintains top-of-book quotes and serves them via `GET /quote/{symbol}`.
-  Emits per-batch feed spans, tick counters and processing-latency
-  histograms; occasionally logs feed-gap resyncs and takes a slow
-  "rebuild from depth" path.
-- **trading-engine** — order entry via `POST /orders`: symbol validation,
-  a pre-trade risk check (max quantity), quote lookup from the feed handler,
-  then simulated execution with slippage. Realistic failure modes: symbol not
-  tradable (400), risk rejects (409), insufficient liquidity (409), venue
-  errors (500) and slow executions.
-- **loadgen** — continuous order flow across accounts/symbols, including
-  deliberately non-tradable symbols and risk-breaching quantities so every
+- **feed-handler** — simulates crypto market-data feeds from three venues
+  (binance, coinbase, kraken) for BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT and
+  DOGE/USDT: random-walk ticks per pair/venue, consolidated into a best
+  bid/offer which is **pushed** to the trading engine once a second — the
+  realistic publisher→subscriber direction (HTTP POST stands in for a
+  WebSocket/multicast bus so trace context propagates). Emits per-batch
+  publish spans, per-pair/venue tick counters, normalisation-latency
+  histograms and occasional venue feed-gap warnings.
+- **trading-engine** — order entry via `POST /orders`: pair validation,
+  local **book lookup** (no network call on the order path — it executes
+  against the cached book kept fresh by the feed pushes, recording a quote
+  **staleness** histogram), a pre-trade **risk check** (max notional
+  250k USD), then simulated execution routed to a venue with slippage.
+  Failure modes: non-tradable pair (400), risk reject (409), insufficient
+  liquidity (409), venue session lost (500) and slow executions.
+- **loadgen** — continuous order flow across 20 accounts and all pairs,
+  including delisted pairs (LUNA/USDT) and notional-breaching sizes so every
   signal (fill, 4xx reject, 5xx error) shows up in the data.
 
 ## Stack components
 
 | Service        | Image                                        | Purpose                                        | Host port |
 |----------------|----------------------------------------------|------------------------------------------------|-----------|
-| trading-engine | built from `apps/trading-engine`             | Order entry; risk check + execution            | 8080      |
-| feed-handler   | built from `apps/feed-handler`               | Market-data simulation + quote API             | —         |
+| trading-engine | built from `apps/trading-engine`             | Order entry; local book + risk + execution     | 8080      |
+| feed-handler   | built from `apps/feed-handler`               | Multi-venue market-data simulation (publisher) | —         |
 | loadgen        | built from `apps/loadgen`                    | Continuous order flow (incl. bad orders)       | —         |
 | otel-collector | otel/opentelemetry-collector-contrib:0.116.1 | Central OTLP pipeline, RED + service-graph metrics | 4317, 4318 |
 | prometheus     | prom/prometheus:v3.1.0                       | Metrics (OTLP → collector → remote write)      | 9092      |
@@ -61,10 +66,11 @@ Then open **Grafana: http://localhost:3001** (admin / admin — override with
 Everything is provisioned automatically:
 
 - **Dashboard**: *OpenTelemetry POC — Service Overview* (folder "OpenTelemetry POC"):
-  request rate, error rate, latency percentiles, orders by outcome,
-  market-data tick rates, live logs.
+  request rate, error rate, latency percentiles, orders by outcome, per-pair
+  tick rates, quote staleness at execution, live logs.
 - **Explore → Tempo**: search traces, open the **Service Graph** tab
-  (powered by the collector's servicegraph metrics in Prometheus).
+  (powered by the collector's servicegraph metrics in Prometheus) — the edge
+  runs `feed-handler → trading-engine`, matching the real data-flow direction.
 - **Correlations**: trace → logs (Loki), trace → metrics (Prometheus),
   log → trace via the `trace_id` structured-metadata link, metric exemplars → traces.
 
@@ -73,25 +79,32 @@ Submit an order yourself:
 ```bash
 curl -s -X POST http://localhost:8080/orders \
   -H 'content-type: application/json' \
-  -d '{"account_id": "ACC-0001", "symbol": "NVDA", "side": "buy", "qty": 100}'
+  -d '{"account_id": "ACC-0001", "pair": "BTC/USDT", "side": "buy", "amount": 0.25}'
 ```
 
 ## What proves it works
 
 - `traces_span_metrics_*` and `traces_service_graph_*` series in Prometheus —
-  spans are being received and converted to RED metrics by the collector.
+  spans are being received and converted to RED metrics by the collector;
+  the service graph shows `feed-handler → trading-engine`.
 - Custom app metrics (`orders_processed_total{outcome=...}`,
-  `feed_ticks_processed_total{symbol=...}`, `trade_notional_USD_*`,
-  `order_execution_duration_seconds_*`) in Prometheus — OTLP metrics path works.
+  `feed_ticks_processed_total{pair,venue}`, `trade_notional_USD_*`,
+  `order_quote_staleness_seconds_*`) in Prometheus — OTLP metrics path works.
 - `{service_name="trading-engine"}` in Loki returns structured logs carrying
   `trace_id` — OTLP logs path + log/trace correlation works.
-- Tempo trace search shows `trading-engine → feed-handler` traces (order →
-  risk check → quote → execution), including error traces for risk rejects
-  and venue failures, plus standalone `process-feed-batch` traces from the
-  feed handler's background loop.
+- Tempo trace search shows cross-service `publish-feed-batch →
+  POST /marketdata` traces (feed-handler into trading-engine) and
+  single-service order traces (`POST /orders` → book lookup → risk check →
+  execution), including error traces for rejects and venue failures.
 
 ## Design decisions
 
+- **Feed handler publishes, engine subscribes**: market data is *pushed*
+  downstream and the trading engine executes against a local book — an order
+  never blocks on a network quote lookup, mirroring real trading systems.
+  The cost is that order traces are single-service; the cross-service traces
+  live on the market-data path, and the quote-staleness histogram covers the
+  freshness risk this pattern introduces.
 - **Collector-centric**: apps only speak OTLP to one endpoint; backends can be
   swapped without touching application code. This is the pattern you would
   keep in production (as a DaemonSet/sidecar + gateway tier on Kubernetes).
@@ -108,9 +121,9 @@ curl -s -X POST http://localhost:8080/orders \
   pipelines). Review cardinality before doing this on a large fleet.
 - **Auto + manual instrumentation**: the Python apps use
   `opentelemetry-instrument` for FastAPI/httpx/logging auto-instrumentation,
-  plus manual custom spans (risk check, execution, feed batches), counters
-  and histograms — demonstrating both approaches. `/healthz` is excluded
-  from tracing via `OTEL_PYTHON_EXCLUDED_URLS`.
+  plus manual custom spans (book lookup, risk check, execution, feed batches),
+  counters and histograms — demonstrating both approaches. `/healthz` is
+  excluded from tracing via `OTEL_PYTHON_EXCLUDED_URLS`.
 
 ## Production hardening checklist (beyond POC scope)
 
